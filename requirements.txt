@@ -1,0 +1,10 @@
+yfinance==0.2.51
+pandas==2.2.3
+numpy==1.26.4
+supabase==2.15.0
+groq==0.23.1
+newsapi-python==0.2.7
+feedparser==6.0.11
+requests==2.32.3
+python-dateutil==2.9.0
+beautifulsoup4==4.12.3
