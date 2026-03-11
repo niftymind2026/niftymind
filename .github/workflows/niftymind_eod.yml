@@ -2,8 +2,8 @@ name: NiftyMind EOD Daily Run
 
 on:
   schedule:
-    # 3:45 PM IST = 10:15 AM UTC
-    - cron: '15 10 * * 1-5'   # Monday to Friday only
+    # 5:00 PM IST = 11:30 AM UTC
+    - cron: '30 11 * * 1-5'   # Monday to Friday only
 
   # Allow manual trigger from GitHub Actions tab
   workflow_dispatch:
