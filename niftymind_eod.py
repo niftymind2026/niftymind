@@ -1067,3 +1067,200 @@ for idx, r in enumerate(master_results[:10], 1):
     print(f"   {idx:<3} {r['symbol']:<18} {r['total_score']:>6} {r['grade']:>5}")
 print(f"\n✅ All engines complete! Data saved to Supabase.")
 print(f"   Next run: Tomorrow at 3:45 PM IST")
+
+# =============================================================
+# SECTION 13: PORTFOLIO MANAGER (PHASE 7)
+# BUY / HOLD / SELL decisions | Max 25 stocks
+# =============================================================
+
+print("\n💼 SECTION 13: PORTFOLIO MANAGER")
+print("-" * 40)
+
+# ── Portfolio Rules ───────────────────────────────────────────
+MAX_POSITIONS     = 25
+CAPITAL           = 1000000   # Rs 10 Lakh
+POSITION_SIZE_PCT = 0.04      # 4% per stock = Rs 40,000
+STOP_LOSS_PCT     = 0.07      # 7% stop loss
+TARGET_PCT        = 0.20      # 20% target
+MIN_SCORE_BUY     = 55        # A grade minimum to BUY
+MIN_SCORE_HOLD    = 40        # B grade minimum to HOLD
+MARKET_SCORE_MIN  = 4         # no new buys if market < 4
+
+# ── Step 1: Load current portfolio ───────────────────────────
+portfolio_resp    = supabase.table("portfolio").select("*").eq("status", "ACTIVE").execute()
+current_portfolio = portfolio_resp.data
+held_symbols      = [p["symbol"] for p in current_portfolio]
+print(f"Current holdings : {len(current_portfolio)}/{MAX_POSITIONS} positions")
+
+# ── Step 2: Load today's scores ───────────────────────────────
+score_map = {r["symbol"]: r for r in master_results}
+
+# ── Step 3: Get market context ────────────────────────────────
+verdict_scores = {"STRONG_BULL": 9, "BULL": 7, "NEUTRAL": 5, "BEAR": 3, "STRONG_BEAR": 1}
+market_score_pm = verdict_scores.get(market["verdict"], 5)
+print(f"Market today     : {market['verdict']} ({market_score_pm}/10)")
+
+# ── Step 4: Process EXITS ─────────────────────────────────────
+print("\n🔴 CHECKING EXITS...")
+exits = []
+
+for position in current_portfolio:
+    symbol      = position["symbol"]
+    entry_price = float(position["entry_price"])
+    stop_loss   = float(position["stop_loss"])
+    target_p    = float(position["target"])
+    quantity    = int(position["quantity"])
+
+    try:
+        ticker = yf.Ticker(symbol)
+        hist   = ticker.history(period="2d", interval="1d", auto_adjust=True)
+        curr_p = round(float(hist["Close"].iloc[-1]), 2) if not hist.empty else entry_price
+    except Exception:
+        curr_p = entry_price
+
+    pnl_pct       = ((curr_p - entry_price) / entry_price) * 100
+    score_data    = score_map.get(symbol, {})
+    current_score = score_data.get("total_score", 0) or 0
+    current_grade = score_data.get("grade", "SKIP")
+    exit_reason   = None
+
+    if curr_p <= stop_loss:
+        exit_reason = f"STOP_LOSS_HIT ({curr_p} <= {stop_loss})"
+    elif curr_p >= target_p:
+        exit_reason = f"TARGET_HIT ({curr_p} >= {target_p})"
+    elif current_score < MIN_SCORE_HOLD and current_grade in ["C", "SKIP"]:
+        exit_reason = f"GRADE_DEGRADED (score:{current_score} grade:{current_grade})"
+    elif market["verdict"] == "STRONG_BEAR" and pnl_pct < 0:
+        exit_reason = f"MARKET_PROTECTION (STRONG_BEAR + {pnl_pct:.1f}%)"
+
+    if exit_reason:
+        realised_pnl = round((curr_p - entry_price) * quantity, 2)
+        try:
+            supabase.table("portfolio").update({
+                "status": "EXITED", "exit_date": TODAY, "exit_price": curr_p,
+                "exit_reason": exit_reason, "realised_pnl": realised_pnl,
+                "current_price": curr_p, "current_value": round(curr_p * quantity, 2),
+                "unrealised_pnl": 0, "unrealised_pnl_pct": 0,
+                "updated_at": datetime.now().isoformat()
+            }).eq("symbol", symbol).eq("status", "ACTIVE").execute()
+            exits.append({"symbol": symbol, "pnl_pct": round(pnl_pct, 2), "pnl_rs": realised_pnl, "reason": exit_reason})
+            print(f"   EXIT: {symbol:<18} {pnl_pct:+.1f}%  {exit_reason[:45]}")
+        except Exception as e:
+            print(f"   ⚠️ Exit error {symbol}: {e}")
+    else:
+        try:
+            supabase.table("portfolio").update({
+                "current_price": curr_p,
+                "current_value": round(curr_p * quantity, 2),
+                "unrealised_pnl": round((curr_p - entry_price) * quantity, 2),
+                "unrealised_pnl_pct": round(pnl_pct, 2),
+                "updated_at": datetime.now().isoformat()
+            }).eq("symbol", symbol).eq("status", "ACTIVE").execute()
+        except Exception:
+            pass
+
+print(f"   Exits today: {len(exits)}")
+
+# ── Step 5: Process ENTRIES ───────────────────────────────────
+held_symbols    = [p["symbol"] for p in current_portfolio if p["symbol"] not in [e["symbol"] for e in exits]]
+slots_available = MAX_POSITIONS - len(held_symbols)
+print(f"\n🟢 CHECKING ENTRIES ({slots_available} slots available)...")
+entries = []
+
+if market["verdict"] == "STRONG_BEAR":
+    print("   ⚠️  STRONG_BEAR — no new entries")
+    slots_available = 0
+elif market_score_pm < MARKET_SCORE_MIN:
+    print(f"   ⚠️  Market score {market_score_pm} < {MARKET_SCORE_MIN} — skipping entries")
+    slots_available = 0
+
+if slots_available > 0:
+    candidates = [
+        r for r in master_results
+        if r["symbol"] not in held_symbols
+        and r["grade"] in ["A+", "A"]
+        and (r["total_score"] or 0) >= MIN_SCORE_BUY
+    ]
+    print(f"   Candidates: {len(candidates)} stocks")
+
+    for stock in candidates[:slots_available]:
+        symbol = stock["symbol"]
+        score  = stock["total_score"] or 0
+        grade  = stock["grade"]
+        price  = float(stock.get("price") or 0)
+
+        try:
+            ticker = yf.Ticker(symbol)
+            hist   = ticker.history(period="2d", interval="1d", auto_adjust=True)
+            if not hist.empty:
+                price = round(float(hist["Close"].iloc[-1]), 2)
+        except Exception:
+            pass
+
+        if price <= 0:
+            continue
+
+        quantity = max(1, int((CAPITAL * POSITION_SIZE_PCT) / price))
+        invested = round(quantity * price, 2)
+        sl       = round(price * (1 - STOP_LOSS_PCT), 2)
+        tgt      = round(price * (1 + TARGET_PCT), 2)
+
+        try:
+            supabase.table("portfolio").insert({
+                "symbol": symbol, "entry_date": TODAY, "entry_price": price,
+                "quantity": quantity, "invested_amount": invested,
+                "current_price": price, "current_value": invested,
+                "unrealised_pnl": 0, "unrealised_pnl_pct": 0,
+                "stop_loss": sl, "target": tgt,
+                "entry_grade": grade, "entry_score": score, "status": "ACTIVE",
+                "notes": f"Auto|Score:{score}|Market:{market['verdict']}",
+                "updated_at": datetime.now().isoformat()
+            }).execute()
+            entries.append({"symbol": symbol, "price": price, "qty": quantity, "sl": sl, "tgt": tgt, "score": score})
+            print(f"   BUY:  {symbol:<18} ₹{price:>8.2f}  qty:{quantity}  SL:₹{sl}  T:₹{tgt}  [{grade}:{score}]")
+        except Exception as e:
+            print(f"   ⚠️ Entry error {symbol}: {e}")
+
+print(f"   Entries today: {len(entries)}")
+
+# ── Step 6: Portfolio Summary ─────────────────────────────────
+final_portfolio  = supabase.table("portfolio").select("*").eq("status", "ACTIVE").execute().data
+total_invested   = sum(float(p.get("invested_amount") or 0) for p in final_portfolio)
+total_value      = sum(float(p.get("current_value")   or 0) for p in final_portfolio)
+total_unrealised = sum(float(p.get("unrealised_pnl")  or 0) for p in final_portfolio)
+cash_remaining   = CAPITAL - total_invested
+cash_pct         = round((cash_remaining / CAPITAL) * 100, 1)
+port_pnl_pct     = round((total_unrealised / total_invested * 100) if total_invested > 0 else 0, 2)
+
+print(f"\n{'='*50}")
+print(f"  PORTFOLIO — {TODAY}")
+print(f"{'='*50}")
+print(f"  Holdings      : {len(final_portfolio)}/{MAX_POSITIONS}")
+print(f"  Invested      : ₹{total_invested:,.0f}")
+print(f"  Current value : ₹{total_value:,.0f}")
+print(f"  Unrealised P&L: ₹{total_unrealised:+,.0f} ({port_pnl_pct:+.2f}%)")
+print(f"  Cash          : ₹{cash_remaining:,.0f} ({cash_pct}%)")
+print(f"  Entries today : {len(entries)}")
+print(f"  Exits today   : {len(exits)}")
+print(f"{'='*50}")
+
+if final_portfolio:
+    sorted_port = sorted(final_portfolio, key=lambda x: float(x.get("unrealised_pnl_pct") or 0), reverse=True)
+    for p in sorted_port[:10]:
+        pct = float(p.get("unrealised_pnl_pct") or 0)
+        print(f"  {p['symbol']:<18} entry:₹{p['entry_price']:>8}  now:₹{str(p.get('current_price','?')):>8}  {pct:+.1f}%")
+
+# ── Step 7: Update daily_summary ─────────────────────────────
+try:
+    supabase.table("daily_summary").upsert({
+        "summary_date": TODAY, "portfolio_size": len(final_portfolio),
+        "cash_pct": cash_pct, "daily_pnl_pct": port_pnl_pct,
+        "new_entries": len(entries), "exits": len(exits),
+        "watching": len([r for r in master_results if r.get("grade") in ["A+", "A"]]),
+        "market_context": market["verdict"],
+    }, on_conflict="summary_date").execute()
+    print(f"\n✅ Portfolio saved to daily_summary!")
+except Exception as e:
+    print(f"   ⚠️ daily_summary error: {e}")
+
+print(f"\n✅ Phase 7 complete! {len(entries)} entries | {len(exits)} exits | {len(final_portfolio)} holdings")
