@@ -707,232 +707,553 @@ if ordered_stocks:
 else:
     print("   ℹ️  No A+/A stocks — skipping news engine")
 
+
 # =============================================================
-# SECTION 12: MARKET CONTEXT ENGINE
+# SECTION 12: MARKET CONTEXT ENGINE (REDESIGNED)
+# Nifty 60% | VIX 20% | FII+DII 20%
+# Nifty = Daily 40% + Weekly 60% + Monthly bonus
+# FII+DII = Weekly cumulative total
 # =============================================================
 
 print("\n🌍 SECTION 12: MARKET CONTEXT ENGINE")
 print("-" * 40)
 
-def fetch_nifty_data():
+def fetch_nifty_full():
+    """
+    Fetch Nifty data for:
+    - Daily change (today vs yesterday)
+    - Weekly change (today vs 5 days ago)
+    - Monthly trend (EMA19 vs EMA55 on monthly)
+    """
     try:
-        nifty=yf.download("^NSEI",period="5d",interval="1d",progress=False,auto_adjust=True)
-        if nifty.empty: raise Exception("Empty")
-        lc=float(nifty["Close"].iloc[-1].iloc[0]); pc=float(nifty["Close"].iloc[-2].iloc[0])
-        wa=float(nifty["Close"].iloc[0].iloc[0])
-        dc=((lc-pc)/pc)*100; wc=((lc-wa)/wa)*100
-        trend="BULLISH" if wc>1.5 else "BEARISH" if wc<-1.5 else "SIDEWAYS"
-        print(f"   Nifty 50 : {lc:,.0f} | Day:{dc:+.2f}% | Week:{wc:+.2f}% | {trend}")
-        return {"nifty_close":lc,"nifty_change":dc,"nifty_trend":trend,"weekly_change":wc}
+        # Daily + weekly from daily data (1 month)
+        daily = yf.download("^NSEI", period="1mo", interval="1d",
+                            progress=False, auto_adjust=True)
+        if daily.empty: raise Exception("Empty daily")
+
+        closes      = [float(daily["Close"].iloc[i].iloc[0]) for i in range(len(daily))]
+        today_close = closes[-1]
+        prev_close  = closes[-2]
+        week_ago    = closes[-6] if len(closes) >= 6 else closes[0]
+
+        daily_chg  = ((today_close - prev_close) / prev_close) * 100
+        weekly_chg = ((today_close - week_ago)   / week_ago)   * 100
+
+        # Monthly trend from monthly data (3 years for EMA)
+        monthly = yf.download("^NSEI", period="3y", interval="1mo",
+                              progress=False, auto_adjust=True)
+        monthly_trend = "SIDEWAYS"
+        ema19_val = ema55_val = 0
+        if not monthly.empty and len(monthly) >= 55:
+            mc = [float(monthly["Close"].iloc[i].iloc[0]) for i in range(len(monthly))]
+            ema19 = float(pd.Series(mc).ewm(span=19, adjust=False).mean().iloc[-1])
+            ema55 = float(pd.Series(mc).ewm(span=55, adjust=False).mean().iloc[-1])
+            ema19_val = round(ema19, 2)
+            ema55_val = round(ema55, 2)
+            monthly_trend = "BULL" if ema19 > ema55 else "BEAR"
+
+        print(f"   Nifty 50  : {today_close:,.0f}")
+        print(f"   Day       : {daily_chg:+.2f}%")
+        print(f"   Week      : {weekly_chg:+.2f}%")
+        print(f"   Monthly   : EMA19={ema19_val:,.0f} vs EMA55={ema55_val:,.0f} → {monthly_trend}")
+
+        return {
+            "close":         today_close,
+            "daily_chg":     daily_chg,
+            "weekly_chg":    weekly_chg,
+            "monthly_trend": monthly_trend,
+            "ema19":         ema19_val,
+            "ema55":         ema55_val
+        }
+
     except Exception as e:
         print(f"   ⚠️ Nifty error: {e}")
-        return {"nifty_close":0,"nifty_change":0,"nifty_trend":"SIDEWAYS","weekly_change":0}
+        return {"close":0,"daily_chg":0,"weekly_chg":0,"monthly_trend":"SIDEWAYS","ema19":0,"ema55":0}
 
-def fetch_vix_data():
+
+def score_nifty(data):
+    """
+    Nifty score = max 6.0 points
+    Daily  40% = max 2.4 pts
+    Weekly 60% = max 3.6 pts
+    Monthly bonus/penalty = +0.5 / -0.5
+    """
+    dc = data["daily_chg"]
+    wc = data["weekly_chg"]
+    mt = data["monthly_trend"]
+
+    # Daily score (max 2.4)
+    if   dc >  1.5: ds = 2.4
+    elif dc >  0.5: ds = 1.8
+    elif dc > -0.5: ds = 1.2
+    elif dc > -1.5: ds = 0.6
+    else:           ds = 0.0
+
+    # Weekly score (max 3.6)
+    if   wc >  3.0: ws = 3.6
+    elif wc >  1.5: ws = 2.7
+    elif wc >  0.0: ws = 1.8
+    elif wc > -1.5: ws = 0.9
+    else:           ws = 0.0
+
+    # Monthly trend bonus
+    mb = +0.5 if mt == "BULL" else -0.5
+
+    raw   = ds + ws + mb
+    final = round(min(6.0, max(0.0, raw)), 2)
+
+    print(f"   Nifty Score: Day({dc:+.2f}%→{ds}) + Week({wc:+.2f}%→{ws}) + Monthly({mt}→{mb:+}) = {final}/6.0")
+    return final, ds, ws, mb
+
+
+def fetch_vix():
+    """VIX score = max 2.0 points"""
     try:
-        vix=yf.download("^INDIAVIX",period="3d",interval="1d",progress=False,auto_adjust=True)
+        vix = yf.download("^INDIAVIX", period="3d", interval="1d",
+                          progress=False, auto_adjust=True)
         if vix.empty: raise Exception("Empty")
-        vv=float(vix["Close"].iloc[-1].iloc[0])
-        vl="VERY_LOW" if vv<13 else "LOW" if vv<16 else "MODERATE" if vv<20 else "HIGH" if vv<25 else "VERY_HIGH"
-        print(f"   India VIX: {vv:.2f} | {vl}")
-        return {"vix_value":vv,"vix_level":vl}
+        vv = float(vix["Close"].iloc[-1].iloc[0])
+        if   vv < 13: vs = 2.0; lbl = "VERY_LOW"
+        elif vv < 16: vs = 1.6; lbl = "LOW"
+        elif vv < 20: vs = 1.2; lbl = "MODERATE"
+        elif vv < 25: vs = 0.6; lbl = "HIGH"
+        elif vv < 30: vs = 0.2; lbl = "VERY_HIGH"
+        else:         vs = 0.0; lbl = "EXTREME"
+        print(f"   VIX Score : {vv:.2f} ({lbl}) = {vs}/2.0")
+        return vs, vv, lbl
     except Exception as e:
-        print(f"   ⚠️ VIX error: {e}")
-        return {"vix_value":20,"vix_level":"MODERATE"}
+        print(f"   ⚠️ VIX error: {e} — using MODERATE fallback")
+        return 1.2, 20.0, "MODERATE"
 
-def fetch_fii_dii():
+
+def fetch_fii_dii_weekly():
+    """
+    FII+DII weekly cumulative score = max 2.0 points
+    Fetches last 5 trading days and sums combined net flow
+    Falls back to NEUTRAL (1.0) if API fails
+    """
     try:
-        headers={"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                 "Accept":"application/json, text/plain, */*",
-                 "Referer":"https://www.nseindia.com/market-data/fii-dii-activity"}
-        s=requests.Session()
-        s.get("https://www.nseindia.com",headers=headers,timeout=10); time.sleep(2)
-        s.get("https://www.nseindia.com/market-data/fii-dii-activity",headers=headers,timeout=10); time.sleep(1)
-        data=s.get("https://www.nseindia.com/api/fiidiiTradeReact",headers=headers,timeout=10).json()
-        fr=next((r for r in data if "FII" in r.get("category","").upper()),None)
-        dr=next((r for r in data if "DII" in r.get("category","").upper()),None)
-        fn=float(fr["netValue"]) if fr else 0.0; dn=float(dr["netValue"]) if dr else 0.0
-        cb=fn+dn
-        fs="STRONG_BUYING" if fn>500 else "BUYING" if fn>0 else "SELLING" if fn>-500 else "STRONG_SELLING"
-        print(f"   FII:{fn:,.0f}Cr {fs} | DII:{dn:,.0f}Cr | Combined:{cb:,.0f}Cr")
-        return {"fii_net":fn,"dii_net":dn,"combined_flow":cb,"fii_sentiment":fs}
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept":     "application/json, text/plain, */*",
+            "Referer":    "https://www.nseindia.com/market-data/fii-dii-activity"
+        }
+        session = requests.Session()
+        session.get("https://www.nseindia.com", headers=headers, timeout=10)
+        time.sleep(2)
+        session.get("https://www.nseindia.com/market-data/fii-dii-activity",
+                    headers=headers, timeout=10)
+        time.sleep(1)
+        data = session.get("https://www.nseindia.com/api/fiidiiTradeReact",
+                           headers=headers, timeout=10).json()
+
+        # Today's data
+        fii_row = next((r for r in data if "FII" in r.get("category","").upper()), None)
+        dii_row = next((r for r in data if "DII" in r.get("category","").upper()), None)
+        today_fii = float(fii_row["netValue"]) if fii_row else 0.0
+        today_dii = float(dii_row["netValue"]) if dii_row else 0.0
+        today_combined = today_fii + today_dii
+
+        # Try to get last 5 days cumulative from agent_memory
+        # Store today's value and sum last 5 days from DB
+        try:
+            supabase.table("agent_memory").upsert({
+                "memory_type": "FII_DII_DAILY",
+                "symbol":      "MARKET",
+                "context":     TODAY,
+                "outcome":     str(round(today_combined, 2)),
+                "lesson":      f"FII:{today_fii:.0f} DII:{today_dii:.0f}"
+            }).execute()
+        except Exception:
+            pass
+
+        # Fetch last 5 records from agent_memory for weekly cumulative
+        hist = supabase.table("agent_memory") \
+            .select("outcome") \
+            .eq("memory_type", "FII_DII_DAILY") \
+            .eq("symbol", "MARKET") \
+            .order("context", desc=True) \
+            .limit(5) \
+            .execute()
+
+        if hist.data and len(hist.data) >= 3:
+            weekly_total = sum(float(r["outcome"]) for r in hist.data)
+        else:
+            weekly_total = today_combined  # fallback to today only
+
+        # Score based on weekly cumulative
+        if   weekly_total >  10000: fs = 2.0
+        elif weekly_total >   5000: fs = 1.6
+        elif weekly_total >   2000: fs = 1.2
+        elif weekly_total >      0: fs = 0.8
+        elif weekly_total >  -2000: fs = 0.4
+        elif weekly_total >  -5000: fs = 0.2
+        else:                       fs = 0.0
+
+        print(f"   FII/DII   : Today={today_combined:,.0f}Cr | Weekly={weekly_total:,.0f}Cr = {fs}/2.0")
+        return fs, today_fii, today_dii, weekly_total
+
     except Exception as e:
-        print(f"   ⚠️ FII/DII error: {e}")
-        return {"fii_net":0,"dii_net":0,"combined_flow":0,"fii_sentiment":"NEUTRAL"}
+        print(f"   ⚠️ FII/DII error: {e} — using NEUTRAL fallback (1.0)")
+        return 1.0, 0.0, 0.0, 0.0  # NEUTRAL as decided
 
-def calc_market_score(nifty,vix,fd):
-    wc=nifty.get("weekly_change",0); vv=vix.get("vix_value",20); cb=fd.get("combined_flow",0)
-    ns=10 if wc>3 else 8 if wc>1.5 else 6 if wc>0 else 4 if wc>-1.5 else 2 if wc>-3 else 0
-    vs=10 if vv<13 else 8 if vv<16 else 6 if vv<20 else 3 if vv<25 else 0
-    fs=10 if cb>2000 else 8 if cb>500 else 6 if cb>0 else 4 if cb>-500 else 2 if cb>-2000 else 0
-    final=int(round((ns+vs+fs)/3))
-    v="STRONG_BULL" if final>=8 else "BULL" if final>=6 else "NEUTRAL" if final>=4 else "BEAR" if final>=2 else "STRONG_BEAR"
-    print(f"   Nifty:{ns}/10 VIX:{vs}/10 Flow:{fs}/10 → {final}/10 {v}")
-    return {"final_score":final,"verdict":v,"nifty_score":ns,"vix_score":vs,"flow_score":fs}
 
-nifty_data=fetch_nifty_data(); vix_data=fetch_vix_data()
-fii_dii_data=fetch_fii_dii(); market=calc_market_score(nifty_data,vix_data,fii_dii_data)
+def calc_market_score_v2(nifty_score, vix_score, fii_score, nifty_data, vix_val, weekly_flow):
+    """
+    Final market context score:
+    Nifty 60% + VIX 20% + FII+DII 20% = 10 points total
+    Already pre-weighted in individual scores (max 6 + max 2 + max 2 = 10)
+    """
+    total = round(nifty_score + vix_score + fii_score, 2)
 
-# Save daily_summary only if real data exists
+    if   total >= 8.0: verdict = "STRONG_BULL"
+    elif total >= 6.0: verdict = "BULL"
+    elif total >= 4.0: verdict = "NEUTRAL"
+    elif total >= 2.0: verdict = "BEAR"
+    else:              verdict = "STRONG_BEAR"
+
+    emoji = "🟢🟢" if verdict=="STRONG_BULL" else "🟢" if verdict=="BULL" else \
+            "🟡"   if verdict=="NEUTRAL"     else "🔴" if verdict=="BEAR" else "🔴🔴"
+
+    print(f"\n   {'─'*45}")
+    print(f"   MARKET CONTEXT SCORE: {total}/10.0  {emoji} {verdict}")
+    print(f"   Nifty : {nifty_score}/6.0  (Day+Week+Monthly)")
+    print(f"   VIX   : {vix_score}/2.0  ({vix_val:.1f})")
+    print(f"   FII+DII: {fii_score}/2.0  (Weekly ₹{weekly_flow:,.0f}Cr)")
+    print(f"   {'─'*45}")
+
+    return {
+        "final_score":  total,
+        "verdict":      verdict,
+        "nifty_score":  nifty_score,
+        "vix_score":    vix_score,
+        "fii_score":    fii_score,
+        "weekly_flow":  weekly_flow
+    }
+
+
+# ── Run Market Context ──────────────────────────────
+nifty_data   = fetch_nifty_full()
+nifty_score, daily_pts, weekly_pts, monthly_bonus = score_nifty(nifty_data)
+vix_score, vix_val, vix_lbl = fetch_vix()
+fii_score, today_fii, today_dii, weekly_flow = fetch_fii_dii_weekly()
+market = calc_market_score_v2(nifty_score, vix_score, fii_score,
+                               nifty_data, vix_val, weekly_flow)
+
+# Save initial daily_summary
 if len(master_results) > 0:
     try:
         supabase.table("daily_summary").upsert({
-            "summary_date":TODAY,"portfolio_size":0,"cash_pct":100,
-            "market_context":market["verdict"],
-            "agent_thoughts":(f"Nifty:{nifty_data['nifty_trend']}({nifty_data['nifty_change']:+.2f}%)|"
-                              f"VIX:{vix_data['vix_value']:.1f}({vix_data['vix_level']})|"
-                              f"FII:₹{fii_dii_data['fii_net']:,.0f}Cr|"
-                              f"Score:{market['final_score']}/10({market['verdict']})")
-        },on_conflict="summary_date").execute()
+            "summary_date":   TODAY,
+            "portfolio_size": 0,
+            "cash_pct":       100,
+            "market_context": market["verdict"],
+            "agent_thoughts": (
+                f"Nifty:{nifty_data['close']:,.0f}|"
+                f"Day:{nifty_data['daily_chg']:+.2f}%|"
+                f"Week:{nifty_data['weekly_chg']:+.2f}%|"
+                f"Monthly:{nifty_data['monthly_trend']}|"
+                f"VIX:{vix_val:.1f}({vix_lbl})|"
+                f"FII:₹{today_fii:,.0f}Cr|"
+                f"DII:₹{today_dii:,.0f}Cr|"
+                f"WeeklyFlow:₹{weekly_flow:,.0f}Cr|"
+                f"Score:{market['final_score']}/10({market['verdict']})"
+            )
+        }, on_conflict="summary_date").execute()
         print(f"✅ daily_summary saved!")
     except Exception as e:
         print(f"   ⚠️ daily_summary error: {e}")
 
-if ordered_stocks:
-    ok=0
-    for stock in ordered_stocks:
+# Update market_context_score on all today's signals
+if master_results:
+    ok = 0
+    market_score_int = int(round(market["final_score"]))
+    for r in master_results:
         try:
-            supabase.table("signals").update({"market_context_score":market["final_score"]}) \
-                .eq("symbol",stock["symbol"]).eq("detected_date",TODAY).execute()
-            ok+=1
-        except Exception: pass
-    print(f"✅ Market context: {ok}/{len(ordered_stocks)} stocks updated")
+            supabase.table("signals") \
+                .update({"market_context_score": market_score_int}) \
+                .eq("symbol", r["symbol"]).eq("detected_date", TODAY).execute()
+            ok += 1
+        except Exception:
+            pass
+    print(f"✅ Market context score applied to {ok} stocks")
 
 # =============================================================
-# SECTION 13: PORTFOLIO MANAGER (PHASE 7)
+# SECTION 13: PORTFOLIO MANAGER — RANKING BASED (REDESIGNED)
+# Daily re-rank all 500 stocks
+# Sell any holding ranked below 40
+# Replace with next best ranked stock
+# Equal 4% allocation | Stop loss 7% | Target 20%
+# Market score reduces effective score (never hard blocks)
 # =============================================================
 
 print("\n💼 SECTION 13: PORTFOLIO MANAGER")
 print("-" * 40)
 
-MAX_POSITIONS=25; CAPITAL=1000000; POSITION_SIZE_PCT=0.04
-STOP_LOSS_PCT=0.07; TARGET_PCT=0.20; MIN_SCORE_BUY=55
-MIN_SCORE_HOLD=40;  MARKET_SCORE_MIN=4
+MAX_POSITIONS    = 25
+CAPITAL          = 1000000    # Rs 10 Lakh
+POSITION_SIZE    = 0.04       # 4% per stock = Rs 40,000
+STOP_LOSS_PCT    = 0.07       # 7%
+TARGET_PCT       = 0.20       # 20%
+RANK_SELL_CUTOFF = 40         # sell if rank drops below this
+MIN_SCORE_ENTRY  = 55         # A grade minimum to enter
 
-port=supabase.table("portfolio").select("*").eq("status","ACTIVE").execute().data
-held=[p["symbol"] for p in port]
-print(f"Current holdings : {len(port)}/{MAX_POSITIONS}")
+# ── BUILD FULL RANKED LIST ──────────────────────────
+# Add market score to each stock's effective score
+# Market score (0-10) → bonus/penalty on total score
+# STRONG_BULL(+3) BULL(+2) NEUTRAL(0) BEAR(-3) STRONG_BEAR(-6)
+market_bonus = {
+    "STRONG_BULL": +3,
+    "BULL":        +2,
+    "NEUTRAL":      0,
+    "BEAR":        -3,
+    "STRONG_BEAR": -6
+}.get(market["verdict"], 0)
 
-sm={r["symbol"]:r for r in master_results}
-vs_map={"STRONG_BULL":9,"BULL":7,"NEUTRAL":5,"BEAR":3,"STRONG_BEAR":1}
-msp=vs_map.get(market["verdict"],5)
-print(f"Market today     : {market['verdict']} ({msp}/10)")
+print(f"Market bonus/penalty : {market_bonus:+d} pts ({market['verdict']})")
 
-# ── EXITS ──────────────────────────────────────────
+# Build ranked list — all scored stocks today
+ranked_all = []
+for r in master_results:
+    effective_score = (r["total_score"] or 0) + market_bonus
+    ranked_all.append({
+        "symbol":          r["symbol"],
+        "name":            r["name"],
+        "sector":          r["sector"],
+        "price":           r["price"],
+        "raw_score":       r["total_score"] or 0,
+        "effective_score": effective_score,
+        "grade":           r["grade"]
+    })
+
+# Sort by effective score descending → this is the rank
+ranked_all.sort(key=lambda x: x["effective_score"], reverse=True)
+
+# Assign ranks
+for i, r in enumerate(ranked_all):
+    r["rank"] = i + 1
+
+rank_map = {r["symbol"]: r for r in ranked_all}
+
+print(f"Total ranked stocks  : {len(ranked_all)}")
+print(f"\n   TOP 10 TODAY:")
+for r in ranked_all[:10]:
+    print(f"   Rank {r['rank']:>3}  {r['symbol']:<18} "
+          f"Raw:{r['raw_score']}  Eff:{r['effective_score']}  {r['grade']}")
+
+# ── LOAD CURRENT PORTFOLIO ──────────────────────────
+port = supabase.table("portfolio").select("*").eq("status", "ACTIVE").execute().data
+print(f"\nCurrent holdings: {len(port)}/{MAX_POSITIONS}")
+
+exits   = []
+entries = []
+
+# ── EXITS — 4 reasons ──────────────────────────────
 print("\n🔴 CHECKING EXITS...")
-exits=[]
+
 for pos in port:
-    sym=pos["symbol"]; ep=float(pos["entry_price"]); sl=float(pos["stop_loss"])
-    tgt=float(pos["target"]); qty=int(pos["quantity"])
+    sym = pos["symbol"]
+    ep  = float(pos["entry_price"])
+    sl  = float(pos["stop_loss"])
+    tgt = float(pos["target"])
+    qty = int(pos["quantity"])
+
+    # Get current price
     try:
-        h=yf.Ticker(sym).history(period="2d",interval="1d",auto_adjust=True)
-        cp=round(float(h["Close"].iloc[-1]),2) if not h.empty else ep
-    except Exception: cp=ep
-    pct=((cp-ep)/ep)*100
-    sd=sm.get(sym,{}); cs=sd.get("total_score",0) or 0; cg=sd.get("grade","SKIP")
-    er=None
-    if cp<=sl: er=f"STOP_LOSS_HIT({cp}<={sl})"
-    elif cp>=tgt: er=f"TARGET_HIT({cp}>={tgt})"
-    elif cs<MIN_SCORE_HOLD and cg in ["C","SKIP"]: er=f"GRADE_DEGRADED(score:{cs})"
-    elif market["verdict"]=="STRONG_BEAR" and pct<0: er=f"MARKET_PROTECTION({pct:.1f}%)"
-    if er:
-        rp=round((cp-ep)*qty,2)
+        h  = yf.Ticker(sym).history(period="2d", interval="1d", auto_adjust=True)
+        cp = round(float(h["Close"].iloc[-1]), 2) if not h.empty else ep
+    except Exception:
+        cp = ep
+
+    pct       = ((cp - ep) / ep) * 100
+    stock_rank = rank_map.get(sym, {}).get("rank", 9999)
+    exit_reason = None
+
+    # Priority order for exits
+    if cp <= sl:
+        exit_reason = f"STOP_LOSS_HIT (₹{cp} ≤ ₹{sl})"
+    elif cp >= tgt:
+        exit_reason = f"TARGET_HIT (₹{cp} ≥ ₹{tgt})"
+    elif stock_rank > RANK_SELL_CUTOFF:
+        exit_reason = f"RANK_DROPPED (rank:{stock_rank} > {RANK_SELL_CUTOFF})"
+    # Note: no hard STRONG_BEAR block — market score already penalises ranks
+
+    if exit_reason:
+        realised = round((cp - ep) * qty, 2)
         try:
             supabase.table("portfolio").update({
-                "status":"EXITED","exit_date":TODAY,"exit_price":cp,
-                "exit_reason":er,"realised_pnl":rp,
-                "current_price":cp,"current_value":round(cp*qty,2),
-                "unrealised_pnl":0,"unrealised_pnl_pct":0,
-                "updated_at":datetime.now().isoformat()
-            }).eq("symbol",sym).eq("status","ACTIVE").execute()
-            exits.append({"symbol":sym,"pnl_pct":round(pct,2),"pnl_rs":rp,"reason":er})
-            print(f"   EXIT: {sym:<18} {pct:+.1f}%  {er[:45]}")
-        except Exception as e: print(f"   ⚠️ {sym}: {e}")
+                "status":           "EXITED",
+                "exit_date":        TODAY,
+                "exit_price":       cp,
+                "exit_reason":      exit_reason,
+                "realised_pnl":     realised,
+                "current_price":    cp,
+                "current_value":    round(cp * qty, 2),
+                "unrealised_pnl":   0,
+                "unrealised_pnl_pct": 0,
+                "updated_at":       datetime.now().isoformat()
+            }).eq("symbol", sym).eq("status", "ACTIVE").execute()
+            exits.append({
+                "symbol": sym, "pnl_pct": round(pct, 2),
+                "pnl_rs": realised, "reason": exit_reason, "rank": stock_rank
+            })
+            print(f"   EXIT: {sym:<18} Rank:{stock_rank:>4}  {pct:+.1f}%  {exit_reason[:40]}")
+        except Exception as e:
+            print(f"   ⚠️ Exit error {sym}: {e}")
     else:
+        # Update current price for holds
         try:
             supabase.table("portfolio").update({
-                "current_price":cp,"current_value":round(cp*qty,2),
-                "unrealised_pnl":round((cp-ep)*qty,2),"unrealised_pnl_pct":round(pct,2),
-                "updated_at":datetime.now().isoformat()
-            }).eq("symbol",sym).eq("status","ACTIVE").execute()
-        except Exception: pass
+                "current_price":      cp,
+                "current_value":      round(cp * qty, 2),
+                "unrealised_pnl":     round((cp - ep) * qty, 2),
+                "unrealised_pnl_pct": round(pct, 2),
+                "updated_at":         datetime.now().isoformat()
+            }).eq("symbol", sym).eq("status", "ACTIVE").execute()
+        except Exception:
+            pass
 
 print(f"   Exits today: {len(exits)}")
 
-# ── ENTRIES ──────────────────────────────────────────
-held=[p["symbol"] for p in port if p["symbol"] not in [e["symbol"] for e in exits]]
-slots=MAX_POSITIONS-len(held)
+# ── ENTRIES — fill slots with top ranked stocks ──────
+exited_symbols = [e["symbol"] for e in exits]
+held_symbols   = [p["symbol"] for p in port if p["symbol"] not in exited_symbols]
+slots          = MAX_POSITIONS - len(held_symbols)
+
 print(f"\n🟢 CHECKING ENTRIES ({slots} slots available)...")
-entries=[]
 
-if market["verdict"]=="STRONG_BEAR":
-    print("   ⚠️  STRONG_BEAR — no new entries"); slots=0
-elif msp<MARKET_SCORE_MIN:
-    print(f"   ⚠️  Market score {msp} < {MARKET_SCORE_MIN} — skipping"); slots=0
+# Candidates: top ranked, not already held, min effective score
+candidates = [
+    r for r in ranked_all
+    if r["symbol"] not in held_symbols
+    and r["effective_score"] >= MIN_SCORE_ENTRY
+    and r["grade"] in ["A+", "A"]
+]
 
-if slots>0:
-    cands=[r for r in master_results if r["symbol"] not in held
-           and r["grade"] in ["A+","A"] and (r["total_score"] or 0)>=MIN_SCORE_BUY]
-    print(f"   Candidates: {len(cands)}")
-    for stock in cands[:slots]:
-        sym=stock["symbol"]; sc=stock["total_score"] or 0; gr=stock["grade"]
-        price=float(stock.get("price") or 0)
-        try:
-            h=yf.Ticker(sym).history(period="2d",interval="1d",auto_adjust=True)
-            if not h.empty: price=round(float(h["Close"].iloc[-1]),2)
-        except Exception: pass
-        if price<=0: continue
-        qty=max(1,int((CAPITAL*POSITION_SIZE_PCT)/price))
-        inv=round(qty*price,2); sl=round(price*(1-STOP_LOSS_PCT),2); tgt=round(price*(1+TARGET_PCT),2)
-        try:
-            supabase.table("portfolio").insert({
-                "symbol":sym,"entry_date":TODAY,"entry_price":price,
-                "quantity":qty,"invested_amount":inv,"current_price":price,"current_value":inv,
-                "unrealised_pnl":0,"unrealised_pnl_pct":0,"stop_loss":sl,"target":tgt,
-                "entry_grade":gr,"entry_score":sc,"status":"ACTIVE",
-                "notes":f"Auto|Score:{sc}|Market:{market['verdict']}",
-                "updated_at":datetime.now().isoformat()
-            }).execute()
-            entries.append({"symbol":sym,"price":price,"qty":qty,"sl":sl,"tgt":tgt,"score":sc})
-            print(f"   BUY: {sym:<18} ₹{price:>8.2f} qty:{qty} SL:₹{sl} T:₹{tgt} [{gr}:{sc}]")
-        except Exception as e: print(f"   ⚠️ {sym}: {e}")
+print(f"   Candidates (rank 1-40, score≥{MIN_SCORE_ENTRY}): {len(candidates)}")
+
+for stock in candidates[:slots]:
+    sym   = stock["symbol"]
+    rank  = stock["rank"]
+    score = stock["effective_score"]
+    grade = stock["grade"]
+    price = float(stock.get("price") or 0)
+
+    # Get fresh price
+    try:
+        h = yf.Ticker(sym).history(period="2d", interval="1d", auto_adjust=True)
+        if not h.empty:
+            price = round(float(h["Close"].iloc[-1]), 2)
+    except Exception:
+        pass
+
+    if price <= 0:
+        continue
+
+    qty = max(1, int((CAPITAL * POSITION_SIZE) / price))
+    inv = round(qty * price, 2)
+    sl  = round(price * (1 - STOP_LOSS_PCT), 2)
+    tgt = round(price * (1 + TARGET_PCT), 2)
+
+    try:
+        supabase.table("portfolio").insert({
+            "symbol":          sym,
+            "entry_date":      TODAY,
+            "entry_price":     price,
+            "quantity":        qty,
+            "invested_amount": inv,
+            "current_price":   price,
+            "current_value":   inv,
+            "unrealised_pnl":  0,
+            "unrealised_pnl_pct": 0,
+            "stop_loss":       sl,
+            "target":          tgt,
+            "entry_grade":     grade,
+            "entry_score":     score,
+            "status":          "ACTIVE",
+            "notes":           f"Rank:{rank}|Raw:{stock['raw_score']}|Eff:{score}|Mkt:{market['verdict']}({market_bonus:+d})",
+            "updated_at":      datetime.now().isoformat()
+        }).execute()
+        entries.append({
+            "symbol": sym, "rank": rank, "price": price,
+            "qty": qty, "sl": sl, "tgt": tgt, "score": score
+        })
+        print(f"   BUY: Rank:{rank:>3}  {sym:<18} ₹{price:>8.2f}  "
+              f"qty:{qty}  SL:₹{sl}  T:₹{tgt}  [{grade}:{score}]")
+    except Exception as e:
+        print(f"   ⚠️ Entry error {sym}: {e}")
 
 print(f"   Entries today: {len(entries)}")
 
-# ── Summary ──────────────────────────────────────────
-fp=supabase.table("portfolio").select("*").eq("status","ACTIVE").execute().data
-ti=sum(float(p.get("invested_amount") or 0) for p in fp)
-tv=sum(float(p.get("current_value")   or 0) for p in fp)
-tu=sum(float(p.get("unrealised_pnl")  or 0) for p in fp)
-cr=CAPITAL-ti; cp_pct=round((cr/CAPITAL)*100,1)
-pp=round((tu/ti*100) if ti>0 else 0,2)
+# ── FINAL PORTFOLIO SUMMARY ──────────────────────────
+fp  = supabase.table("portfolio").select("*").eq("status", "ACTIVE").execute().data
+ti  = sum(float(p.get("invested_amount") or 0) for p in fp)
+tv  = sum(float(p.get("current_value")   or 0) for p in fp)
+tu  = sum(float(p.get("unrealised_pnl")  or 0) for p in fp)
+cr  = CAPITAL - ti
+cpc = round((cr / CAPITAL) * 100, 1)
+pp  = round((tu / ti * 100) if ti > 0 else 0, 2)
 
-print(f"\n{'='*55}")
-print(f"  NIFTYMIND AI — PORTFOLIO {TODAY}")
-print(f"{'='*55}")
-print(f"  Holdings : {len(fp)}/{MAX_POSITIONS}  |  Market: {market['verdict']}")
-print(f"  Invested : ₹{ti:,.0f}  |  Value: ₹{tv:,.0f}")
-print(f"  P&L      : ₹{tu:+,.0f} ({pp:+.2f}%)")
-print(f"  Cash     : ₹{cr:,.0f} ({cp_pct}%)")
-print(f"  Entries  : {len(entries)}  |  Exits: {len(exits)}")
-print(f"{'='*55}")
+print(f"\n{'='*60}")
+print(f"  NIFTYMIND AI — PORTFOLIO SUMMARY  {TODAY}")
+print(f"{'='*60}")
+print(f"  Holdings  : {len(fp)}/{MAX_POSITIONS}")
+print(f"  Invested  : ₹{ti:>12,.0f}")
+print(f"  Value     : ₹{tv:>12,.0f}")
+print(f"  P&L       : ₹{tu:>+12,.0f}  ({pp:+.2f}%)")
+print(f"  Cash      : ₹{cr:>12,.0f}  ({cpc}%)")
+print(f"  Entries   : {len(entries)}   Exits: {len(exits)}")
+print(f"{'─'*60}")
+print(f"  MARKET    : {market['final_score']}/10  {market['verdict']}")
+print(f"  Nifty     : {market['nifty_score']}/6.0  "
+      f"(Day:{nifty_data['daily_chg']:+.2f}% Wk:{nifty_data['weekly_chg']:+.2f}% "
+      f"Monthly:{nifty_data['monthly_trend']})")
+print(f"  VIX       : {market['vix_score']}/2.0  ({vix_val:.1f} {vix_lbl})")
+print(f"  FII+DII   : {market['fii_score']}/2.0  (Weekly ₹{weekly_flow:,.0f}Cr)")
+print(f"{'─'*60}")
 
 if fp:
-    for p in sorted(fp,key=lambda x:float(x.get("unrealised_pnl_pct") or 0),reverse=True)[:10]:
-        pct=float(p.get("unrealised_pnl_pct") or 0)
-        print(f"  {p['symbol']:<18} ₹{p['entry_price']:>8} → ₹{str(p.get('current_price','?')):>8}  {pct:+.1f}%")
+    print(f"  {'SYMBOL':<18} {'ENTRY':>8} {'NOW':>8} {'P&L':>8}  RANK")
+    print(f"  {'─'*55}")
+    for p in sorted(fp, key=lambda x: float(x.get("unrealised_pnl_pct") or 0), reverse=True):
+        pct  = float(p.get("unrealised_pnl_pct") or 0)
+        rank = rank_map.get(p["symbol"], {}).get("rank", "?")
+        cp_  = p.get("current_price", "?")
+        print(f"  {p['symbol']:<18} ₹{float(p['entry_price']):>7.2f} "
+              f"₹{str(cp_):>7}  {pct:>+6.1f}%  #{rank}")
 
-if len(master_results)>0:
+print(f"{'='*60}")
+
+# Update daily_summary with full portfolio data
+if len(master_results) > 0:
     try:
         supabase.table("daily_summary").upsert({
-            "summary_date":TODAY,"portfolio_size":len(fp),"cash_pct":cp_pct,
-            "daily_pnl_pct":pp,"new_entries":len(entries),"exits":len(exits),
-            "watching":len([r for r in master_results if r.get("grade") in ["A+","A"]]),
-            "market_context":market["verdict"]
-        },on_conflict="summary_date").execute()
-        print(f"\n✅ daily_summary updated!")
+            "summary_date":   TODAY,
+            "portfolio_size": len(fp),
+            "cash_pct":       cpc,
+            "daily_pnl_pct":  pp,
+            "new_entries":    len(entries),
+            "exits":          len(exits),
+            "watching":       len([r for r in ranked_all if r["rank"] <= 40]),
+            "market_context": market["verdict"],
+            "full_summary": (
+                f"Date:{TODAY} | "
+                f"Holdings:{len(fp)}/{MAX_POSITIONS} | "
+                f"P&L:₹{tu:+,.0f}({pp:+.2f}%) | "
+                f"Cash:₹{cr:,.0f}({cpc}%) | "
+                f"Entries:{len(entries)} Exits:{len(exits)} | "
+                f"Market:{market['final_score']}/10 {market['verdict']} | "
+                f"Nifty:{market['nifty_score']}/6(Day:{nifty_data['daily_chg']:+.2f}% "
+                f"Wk:{nifty_data['weekly_chg']:+.2f}% {nifty_data['monthly_trend']}) | "
+                f"VIX:{market['vix_score']}/2({vix_val:.1f} {vix_lbl}) | "
+                f"FII+DII:{market['fii_score']}/2(₹{weekly_flow:,.0f}Cr weekly)"
+            )
+        }, on_conflict="summary_date").execute()
+        print(f"\n✅ daily_summary updated with full breakdown!")
     except Exception as e:
         print(f"   ⚠️ daily_summary error: {e}")
 
-print(f"\n✅ ALL DONE! {len(entries)} entries | {len(exits)} exits | {len(fp)} holdings")
+print(f"\n✅ ALL DONE!")
+print(f"   Entries:{len(entries)}  Exits:{len(exits)}  Holdings:{len(fp)}")
+print(f"   Market: {market['final_score']}/10 {market['verdict']}")
 print(f"   Next auto-run: Tomorrow 5:00 PM IST")
